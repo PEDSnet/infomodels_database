@@ -1,0 +1,324 @@
+package database
+
+import (
+	"database/sql"
+	"fmt"
+	"github.com/infomodels/datadirectory"
+	"github.com/infomodels/datapackage"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+type TestEnv struct {
+	DatabaseUrl, Schema, DmsaUrl, DmUrl, Model, ModelVersion, TempDir string
+	PedsnetVocabDataDir                                               *datadirectory.DataDirectory
+}
+
+// A zip file containing some test vocab data
+var pedsnetVocabUrl = "http://github.com/infomodels/database/test_resources/pedsnet_vocab.tar.gz"
+
+// NewTestEnv initializes the test environment from environment variables.
+//
+// Call the Cleanup() method afterwards to remove temp files.
+//
+// The `DT_DATABASE_URL` variable is required.
+//
+// The optional variable `DT_DMSA_URL` allows overriding the default
+// of http://data-models-sqlalchemy.research.chop.edu/.
+//
+// The optional variable `DT_DM_URL` allows overriding the default
+// of http://data-models-service.research.chop.edu/.
+//
+// The optional variable `DT_VOCAB_URL` allows overriding the default of
+// http://github.com/infomodels/database/test_resources/pedsnet_vocab.tar.gz
+func NewTestEnv(t *testing.T) *TestEnv {
+
+	te := new(TestEnv)
+
+	if te.DatabaseUrl = os.Getenv("DT_DATABASE_URL"); te.DatabaseUrl == "" {
+		t.Error("DT_DATABASE_URL environment variable required for testing")
+		t.FailNow()
+	}
+
+	te.DmsaUrl = os.Getenv("DT_DMSA_URL")
+	if te.DmUrl == "" {
+		te.DmUrl = "http://data-models-sqlalchemy.research.chop.edu/"
+	}
+
+	te.DmUrl = os.Getenv("DT_DM_URL")
+	if te.DmUrl == "" {
+		te.DmUrl = "http://data-models-service.research.chop.edu/"
+	}
+
+	var err error
+	te.TempDir, err = ioutil.TempDir("", "testdatadir")
+	if err != nil {
+		t.Error(fmt.Sprintf("TempDir failed: %v", err))
+		t.FailNow()
+	}
+
+	vocabUrl := os.Getenv("DT_VOCAB_URL")
+	if vocabUrl != "" {
+		pedsnetVocabUrl = vocabUrl
+	}
+
+	var pedsnetVocabZipFile = filepath.Join(te.TempDir, "pedsnet_vocab.tar.gz")
+
+	if err = downloadFile(pedsnetVocabZipFile, pedsnetVocabUrl); err != nil {
+		t.Error(fmt.Sprintf("Failed to download '%s' to a temp file: %v", pedsnetVocabUrl, err))
+		t.FailNow()
+	}
+
+	pedsnetVocabDataDirPath := filepath.Join(te.TempDir, "pedsnet_vocab")
+
+	pkg := datapackage.DataPackage{PackagePath: pedsnetVocabZipFile}
+	if err = pkg.Unpack(pedsnetVocabDataDirPath); err != nil {
+		t.Error(fmt.Sprintf("Failed to unpack '%s': %v", pedsnetVocabUrl, err))
+		t.FailNow()
+	}
+
+	cfg := &datadirectory.Config{
+		DataDirPath: pedsnetVocabDataDirPath,
+		Service:     te.DmUrl,
+	}
+
+	if te.PedsnetVocabDataDir, err = datadirectory.New(cfg); err != nil {
+		t.Error(fmt.Sprintf("Failed to create new PEDSnet vocab DataDirectory object: %v", err))
+		t.FailNow()
+	}
+
+	err = te.PedsnetVocabDataDir.ReadMetadataFromFile()
+	if err != nil {
+		t.Error(fmt.Sprintf("Failed to read metadata from file: %v", err))
+		t.FailNow()
+	}
+
+	return te
+}
+
+func (te *TestEnv) Cleanup() {
+	os.RemoveAll(te.TempDir)
+}
+
+// execSql executes a non-SELECT SQL statement
+func execSql(db *sql.DB, sql string) error {
+	_, err := db.Exec(sql)
+	if err != nil {
+		return fmt.Errorf("Error running `%s`: %v", sql, err)
+	}
+	return nil
+}
+
+// Create a database schema for postgres
+func createSchema(db *sql.DB, schema string) error {
+	var sql = fmt.Sprintf("create schema %s", schema)
+	err := execSql(db, sql)
+	if err != nil {
+		if strings.Contains(err.Error(), "already exists") {
+			return fmt.Errorf("Can't run test if `%s` schema already exists", schema)
+		}
+	}
+	return err
+}
+
+// dropSchema drops a database schema for postgres.
+// The `cascade` option is used, so this will blow away a schema even if it contains data.
+func dropSchema(db *sql.DB, schema string) error {
+	return execSql(db, fmt.Sprintf("drop schema %s cascade", schema))
+}
+
+func testFunc(t *testing.T, f func() error, funcName string) {
+	if err := f(); err != nil {
+		t.Error(fmt.Sprintf("%s failed: %v", funcName, err))
+		t.FailNow()
+	}
+}
+
+// introspectTables returns the tables in a specified `schema` using database handle `db`.
+// The table names are returned as keys of a map[string]bool.
+func introspectTables(t *testing.T, db *sql.DB, schema string) map[string]bool {
+	sql := "select table_name from information_schema.tables where table_schema = $1"
+	rows, err := db.Query(sql, schema)
+	if err != nil {
+		t.Error(fmt.Sprintf("db.Query failed for `%s`: %v", sql, err))
+		t.FailNow()
+	}
+	defer rows.Close()
+	tables := make(map[string]bool)
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			t.Error(fmt.Sprintf("rows.Scan failed for `%s`: %v", sql, err))
+			t.FailNow()
+		}
+		tables[table] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Error(fmt.Sprintf("rows.Err returned error for `%s`: %v", sql, err))
+		t.FailNow()
+	}
+	return tables
+}
+
+func mapContainsValues(has map[string]bool, values []string) bool {
+	for _, val := range values {
+		if !has[val] {
+			return false
+		}
+	}
+	return true
+}
+
+var pedsnetVocabDataModel string = "pedsnet-vocab"
+var pedsnetCoreDataModel string = "pedsnet-core"
+var pedsnetDataModelVersion string = "2.2.0"
+var pedsnetVocabSchema string = "dt_pedsnet_vocab"
+var pedsnetCoreSchema string = "dt_pedsnet_core,dt_pedsnet_vocab"
+
+// // keysInMap returns a slice containing the keys from a map whose keys are strings.
+// func keysInMap(m map[string]string) []string {
+//   keys := make([]string, len(m))
+//   i := 0
+//   for k := range m {
+//     keys[i] = k
+//     i++
+//   }
+//   return keys
+// }
+
+// primarySchema returns the primary schema of a PostgreSQL-style comma-separated searchpath.
+func primarySchema(searchPath string) string {
+	var primarySchema = searchPath
+	schemas := strings.Split(searchPath, ",")
+	if len(schemas) > 0 {
+		primarySchema = schemas[0]
+	}
+	return primarySchema
+}
+
+// Note: schema may be a comma-separated list of schemas, the first of which is primary, as in PostgreSQL
+func instantiateDataModel(t *testing.T, te *TestEnv, dataModel string, dataModelVersion string, schema string, verifyTables []string, shouldLoad bool) {
+	var (
+		err error
+		d   *Database
+	)
+	if d, err = Open(dataModel, dataModelVersion, te.DatabaseUrl, schema, te.DmsaUrl, "", ""); err != nil {
+		t.Error(fmt.Sprintf("Open failed: %v", err))
+		t.FailNow()
+	}
+	defer d.Close()
+
+	if err = createSchema(d.db, primarySchema(schema)); err != nil {
+		t.Error(fmt.Sprintf("Tests require the ability to create schemas: %v", err))
+		t.FailNow()
+	}
+
+	testFunc(t, d.CreateTables, "CreateTables")
+	tables := introspectTables(t, d.db, primarySchema(d.Schema))
+	if !mapContainsValues(tables, verifyTables) {
+		t.Error("Table creation failed:")
+		t.Error(fmt.Sprintf("Expected tables: %v", verifyTables))
+		t.Error(fmt.Sprintf("Candidate tables: %v", tables))
+		t.FailNow()
+	}
+
+	if shouldLoad {
+		loadDataModel(t, te, pedsnetVocabDataModel, pedsnetDataModelVersion, pedsnetVocabSchema, verifyTables)
+	}
+
+	// TODO: verify these operations also:
+	testFunc(t, d.CreateIndexes, "CreateIndexes")
+	testFunc(t, d.CreateConstraints, "CreateConstraints")
+} // end func instantiateDataModel
+
+// Note: schema may be a comma-separated list of schemas, the first of which is primary, as in PostgreSQL
+func loadDataModel(t *testing.T, te *TestEnv, dataModel string, dataModelVersion string, schema string, verifyTables []string) {
+	var (
+		err error
+		d   *Database
+	)
+	if d, err = Open(dataModel, dataModelVersion, te.DatabaseUrl, schema, te.DmsaUrl, "", ""); err != nil {
+		t.Error(fmt.Sprintf("Open failed: %v", err))
+		t.FailNow()
+	}
+	defer d.Close()
+
+	d.Load(te.PedsnetVocabDataDir)
+
+} // end func loadDataModel
+
+func instantiatePedsnetVocab(t *testing.T, te *TestEnv) {
+	verifyTables := []string{"concept", "concept_ancestor", "concept_class", "concept_relationship", "concept_synonym", "domain", "drug_strength", "relationship", "source_to_concept_map", "version_history", "vocabulary"}
+	instantiateDataModel(t, te, pedsnetVocabDataModel, pedsnetDataModelVersion, pedsnetVocabSchema, verifyTables, true)
+}
+
+func instantiatePedsnetCore(t *testing.T, te *TestEnv) {
+	verifyTables := []string{
+		"care_site",
+		"condition_occurrence",
+		"death",
+		"drug_exposure",
+		"fact_relationship",
+		"location",
+		"measurement",
+		"measurement_organism",
+		"observation",
+		"observation_period",
+		"person",
+		"procedure_occurrence",
+		"provider",
+		"version_history",
+		"visit_occurrence",
+		"visit_payer",
+	}
+	instantiateDataModel(t, te, pedsnetCoreDataModel, pedsnetDataModelVersion, pedsnetCoreSchema, verifyTables, false)
+}
+
+func destroyDataModel(t *testing.T, te *TestEnv, dataModel string, dataModelVersion string, schema string) {
+	var (
+		err error
+		d   *Database
+	)
+	if d, err = Open(dataModel, dataModelVersion, te.DatabaseUrl, schema, te.DmsaUrl, "", ""); err != nil {
+		t.Error(fmt.Sprintf("Open failed: %v", err))
+		t.FailNow()
+	}
+	defer d.Close()
+
+	// TODO: verify these operations
+	testFunc(t, d.DropConstraints, "DropConstraints")
+	testFunc(t, d.DropIndexes, "DropIndexes")
+	testFunc(t, d.DropTables, "DropTables")
+
+	if err = dropSchema(d.db, primarySchema(d.Schema)); err != nil {
+		t.Error(fmt.Sprintf("Warning: dropping test schema %s failed: %v", d.Schema, err))
+		t.FailNow()
+	}
+}
+
+func destroyPedsnetVocab(t *testing.T, te *TestEnv) {
+	destroyDataModel(t, te, pedsnetVocabDataModel, pedsnetDataModelVersion, pedsnetVocabSchema)
+}
+
+func destroyPedsnetCore(t *testing.T, te *TestEnv) {
+	destroyDataModel(t, te, pedsnetCoreDataModel, pedsnetDataModelVersion, pedsnetCoreSchema)
+}
+
+// TestPedsnetInParts tests the 'pedsnet-core' data model, which is
+// assumed to not include the vocabulary tables (but those must exist
+// in the schema search path) and the 'pedsnet-vocab' data model,
+// which is assumed to include just the vocabulary tables.
+func TestPedsnetInParts(t *testing.T) {
+
+	te := NewTestEnv(t)
+
+	instantiatePedsnetVocab(t, te)
+	instantiatePedsnetCore(t, te)
+	destroyPedsnetCore(t, te)
+	destroyPedsnetVocab(t, te)
+
+	te.Cleanup()
+}
