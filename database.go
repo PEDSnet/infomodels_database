@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io/ioutil"
+	log "github.com/Sirupsen/logrus"
 	"net/http"
 	"net/url"
 	"os"
@@ -426,7 +427,8 @@ func Open(model string, modelVersion string, databaseUrl string, schema string, 
 		if excludeTablesPat == "" {
 			excludeTablesPat = pedsnetVocabTablesPat
 			if !versionMatchesMinorVersion(modelVersion, pedsnetMinorVersionSupported) {
-				fmt.Fprintf(os.Stderr, "WARNING: this code only supports the %s version series for the pedsnet model", pedsnetMinorVersionSupported)
+				log.WithFields(log.Fields{"VersionSupported": pedsnetMinorVersionSupported}).Warn(
+fmt.Sprintf("WARNING: this code only supports the %s version series for the pedsnet model", pedsnetMinorVersionSupported))
 			}
 		}
 	} else if model == "pedsnet-vocab" {
