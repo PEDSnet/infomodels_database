@@ -52,7 +52,7 @@ func copyCommand(databaseUrl string, schema string, table string, csvFile string
 		return nil, fmt.Errorf("Invalid database URL: %v", databaseUrl)
 	}
 
-	var cmd = fmt.Sprintf(`psql "%s" -c "\COPY %s.%s(%s) FROM '%s' (FORMAT csv, HEADER true, ENCODING 'utf-8')"`, connectionString, schema, table, columns, csvFile)
+	var cmd = fmt.Sprintf(`psql "%s" -c "\COPY %s.%s(%s) FROM '%s' (FORMAT csv, HEADER true, ENCODING 'utf-8', FORCE_NULL(%s), FREEZE)"`, connectionString, schema, table, columns, csvFile, columns)
 	return exec.Command("sh", "-c", cmd), nil
 }
 
