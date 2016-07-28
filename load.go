@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/csv"
 	"fmt"
+	log "github.com/Sirupsen/logrus"
 	"github.com/infomodels/datadirectory"
 	"github.com/lib/pq" // PostgreSQL database driver
 	"os"
@@ -31,29 +32,47 @@ func columnNamesFromCsvFile(fileName string) ([]string, error) {
 	return record, nil
 }
 
+type CopyCommandArgs struct {
+	DatabaseUrl string
+	Schema      string
+	Table       string
+	CsvFile     string
+	WaitGroup   sync.WaitGroup
+}
+
 // copyCommand returns an exec.Command for loading a CSV data file into a database using `psql` via the shell.
 // CSV files are assumed to be named {table}.csv within a top-level directory in the zip file.
 // The column names are first extracted from the CSV file so we assign columns in the CSV file to the correct columns in the table.
-func copyCommand(databaseUrl string, schema string, table string, csvFile string, wg sync.WaitGroup) (*exec.Cmd, error) {
+func copyCommand(databaseUrl string, schema string, table string, csvFile string, wg sync.WaitGroup) error {
 
 	columnNames, err := columnNamesFromCsvFile(csvFile)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	if _, err := exec.LookPath("psql"); err != nil {
-		return nil, fmt.Errorf("`psql` binary must be in PATH")
+		return fmt.Errorf("`psql` binary must be in PATH")
 	}
 
 	columns := strings.Join(columnNames, ", ")
 
 	connectionString, err := pq.ParseURL(databaseUrl)
 	if err != nil {
-		return nil, fmt.Errorf("Invalid database URL: %v", databaseUrl)
+		return fmt.Errorf("Invalid database URL: %v", databaseUrl)
 	}
 
-	var cmd = fmt.Sprintf(`psql "%s" -c "\COPY %s.%s(%s) FROM '%s' (FORMAT csv, HEADER true, ENCODING 'utf-8', FORCE_NULL(%s), FREEZE)"`, connectionString, schema, table, columns, csvFile, columns)
-	return exec.Command("sh", "-c", cmd), nil
+	cmdStr := fmt.Sprintf(`psql "%s" -c "\COPY %s.%s(%s) FROM '%s' (FORMAT csv, HEADER true, ENCODING 'utf-8', FORCE_NULL(%s))"`, connectionString, schema, table, columns, csvFile, columns)
+
+	cmd := exec.Command("sh", "-c", cmdStr)
+	var e bytes.Buffer
+	cmd.Stderr = &e
+	err = cmd.Run()
+	if err != nil {
+		return fmt.Errorf("Error running command with `sh -c`: %v (STDERR: %s)", cmdStr, err, string(e.Bytes()))
+	} else {
+		log.Info(fmt.Sprintf("Loaded %s.%s", schema, table))
+	}
+	return nil
 }
 
 // versionToShorthand - given a version string such as "X.Y.Z", return "XY"
@@ -80,7 +99,7 @@ func (d *Database) load(datadirectory *datadirectory.DataDirectory) error {
 	var err error
 
 	// We will parallelize our loads, using a concurrency of 4, or the number in the PREPDB_JOBS environment variable
-	tasks := make(chan *exec.Cmd, 100) // 100 is an impossibly large number of vocab files
+	tasks := make(chan *CopyCommandArgs, 100) // 100 is an impossibly large number of vocab files
 	taskErrors := make(chan error, 100)
 
 	numJobs := 4
@@ -97,11 +116,10 @@ func (d *Database) load(datadirectory *datadirectory.DataDirectory) error {
 	for i := 0; i < numJobs; i++ {
 		wg.Add(1)
 		go func(n int) {
-			for cmd := range tasks {
-				var e bytes.Buffer
-				cmd.Stderr = &e
-				if err := cmd.Run(); err != nil {
-					taskErrors <- fmt.Errorf("Error running command: %s: %v (%s)", strings.Join(cmd.Args, " "), err, string(e.Bytes()))
+			for args := range tasks {
+				err := copyCommand(args.DatabaseUrl, args.Schema, args.Table, args.CsvFile, args.WaitGroup)
+				if err != nil {
+					taskErrors <- err
 				}
 			}
 			wg.Done()
@@ -113,11 +131,13 @@ func (d *Database) load(datadirectory *datadirectory.DataDirectory) error {
 	for _, m := range datadirectory.RecordMaps {
 		table := m["table"]
 		fileName := path.Join(datadirectory.DirPath, m["filename"])
-		cmd, err := copyCommand(d.DatabaseUrl, d.Schema, table, fileName, wg)
-		if err != nil {
-			return fmt.Errorf("load: error in copyCommand: %v", err)
-		}
-		tasks <- cmd
+		copyArgs := &CopyCommandArgs{
+			DatabaseUrl: d.DatabaseUrl,
+			Schema:      d.Schema,
+			Table:       table,
+			CsvFile:     fileName,
+			WaitGroup:   wg}
+		tasks <- copyArgs
 	} // end for all files
 
 	close(tasks) // This will cause the channel receivers (tasks) to finish their range loops

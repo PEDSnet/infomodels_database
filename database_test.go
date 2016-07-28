@@ -6,6 +6,7 @@ import (
 	"github.com/infomodels/datadirectory"
 	"github.com/infomodels/datapackage"
 	"io/ioutil"
+	//	log "github.com/Sirupsen/logrus"
 	"os"
 	"path/filepath"
 	"strings"
@@ -263,6 +264,18 @@ func loadDataModel(t *testing.T, te *TestEnv, dataModel string, dataModelVersion
 
 	d.Load(te.PedsnetVocabDataDir)
 
+	var count int
+	sql := fmt.Sprintf("select count(*) as count from %s.concept", schema)
+	err = d.db.QueryRow(sql).Scan(&count)
+	if err != nil {
+		t.Error(fmt.Sprintf("Can't get count of concept table: %v", err))
+		t.FailNow()
+	}
+	expected := 1148
+	if count != expected {
+		t.Error(fmt.Sprintf("Count of rows in concept table incorrect (%d, should be %d)", count, expected))
+		t.FailNow()
+	}
 } // end func loadDataModel
 
 func instantiatePedsnetVocab(t *testing.T, te *TestEnv) {
