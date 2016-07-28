@@ -4,8 +4,8 @@ package database
 import (
 	"database/sql"
 	"fmt"
-	"io/ioutil"
 	log "github.com/Sirupsen/logrus"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
@@ -159,14 +159,14 @@ func transact(db *sql.DB, txFunc func(*sql.Tx, ...interface{}) error, args ...in
 }
 
 // execute runs a SQL statement within a transaction `tx` or prints the SQL
-// on stdout if tx is nil.  Leading whitespace is stripped, for clean logs.
-func executeSQL(tx *sql.Tx, sql string) error {
+// on stdout if db is nil.  Leading whitespace is stripped, for clean logs.
+func executeSQL(db *sql.DB, sql string) error {
 	sql = strings.TrimSpace(sql)
-	if tx == nil {
+	if db == nil {
 		fmt.Printf("%s;\n", sql)
 	} else {
 		//    fmt.Printf("%s;\n", sql)
-		if _, err := tx.Exec(sql); err != nil {
+		if _, err := db.Exec(sql); err != nil {
 			return fmt.Errorf("Error executing SQL: %v: %v", sql, err)
 		}
 	}
@@ -356,19 +356,22 @@ func dmsaSql(d *Database, ddlOperator string, ddlOperand string, patterns interf
 //  * a Database object,
 //  * the DMSA DDL operation ("ddl" or "drop"),
 //  * the DMSA operand ("tables", "indexes", or "constraints",
-//  * and a struct containing pattern strings, of type normalPatternsType or mapPatternsType.
+//  * a struct containing pattern strings, of type normalPatternsType or mapPatternsType.
+//  * and an error sensitivity level: "normal" (ignore "does not exist" and "already exists" errors), "strict" (ignore no errors) or "force" (ignore all errors)
+//
+// When errors occur, they are logged.
+//
+// TODO: the whole SQL execution pattern should be rewritten to follow Aaron's Python module.
 //
 // See also dmsaSql.
-//
-// `tx` is a transaction handle suitable for executing SQL statements.
-// If tx is nil, SQL is emitted on stdout instead of being executed.
-func operateOnTables(tx *sql.Tx, args ...interface{}) error {
+func operateOnTables(db *sql.DB, args ...interface{}) (lastError error) {
 	var (
 		err          error
 		d            *Database = args[0].(*Database)
 		ddlOperation           = args[1].(string)
 		ddlOperand             = args[2].(string)
 		patterns               = args[3]
+		errorMode              = args[4]
 	)
 
 	var stmts []string
@@ -379,7 +382,7 @@ func operateOnTables(tx *sql.Tx, args ...interface{}) error {
 
 	if d.Schema != "" {
 		if d.driverName == "postgres" {
-			if err = executeSQL(tx, fmt.Sprintf("SET search_path TO %s", d.Schema)); err != nil {
+			if err = executeSQL(db, fmt.Sprintf("SET search_path TO %s", d.Schema)); err != nil {
 				return err
 			}
 		} else {
@@ -388,10 +391,35 @@ func operateOnTables(tx *sql.Tx, args ...interface{}) error {
 	}
 
 	for _, stmt := range stmts {
-		if err = executeSQL(tx, stmt); err != nil {
-			return fmt.Errorf("Error executing SQL: `%v`: %v", stmt, err)
+		if err = executeSQL(db, stmt); err != nil {
+			lastError = fmt.Errorf("Error executing SQL: `%v`: %v", stmt, err)
+			if errorMode == "force" {
+				// Ignore this error
+			} else if errorMode == "normal" {
+				// Maybe tolerate this error
+				errStr := err.Error()
+				if strings.Contains(errStr, "already exists") || strings.Contains(errStr, "does not exist") {
+					// Ignore this error
+				} else {
+					// This error is fatal
+					log.Error(lastError.Error())
+					return
+				}
+			} else if errorMode == "strict" {
+				// This error is fatal
+				log.Error(lastError.Error())
+				return
+			} else {
+				return fmt.Errorf("Invalid error mode: %s", errorMode)
+			}
 		}
 	} // end for all SQL statements
+
+	// Assert: any errors were ignored, so we want to log but return nil
+	if lastError != nil {
+		lastError = fmt.Errorf("Ignored one or more errors according to the error mode. Last error was as follows: %s", lastError.Error())
+		log.Warn(lastError.Error())
+	}
 	return nil
 } // end func operateOnTables
 
@@ -428,7 +456,7 @@ func Open(model string, modelVersion string, databaseUrl string, schema string, 
 			excludeTablesPat = pedsnetVocabTablesPat
 			if !versionMatchesMinorVersion(modelVersion, pedsnetMinorVersionSupported) {
 				log.WithFields(log.Fields{"VersionSupported": pedsnetMinorVersionSupported}).Warn(
-fmt.Sprintf("WARNING: this code only supports the %s version series for the pedsnet model", pedsnetMinorVersionSupported))
+					fmt.Sprintf("WARNING: this code only supports the %s version series for the pedsnet model", pedsnetMinorVersionSupported))
 			}
 		}
 	} else if model == "pedsnet-vocab" {
@@ -484,7 +512,7 @@ func (d *Database) Close() error {
 // CreateTables creates the data model tables.
 // DDL SQL is obtained from the data-models-sqlalchemy service, i.e.
 // https://data-models-sqlalchemy.research.chop.edu/{Model}/{ModelVersion}/ddl/postgresql/tables/.
-func (d *Database) CreateTables() error {
+func (d *Database) CreateTables(errorMode string) error {
 
 	var tablePattern string
 	if d.driverName == "postgres" {
@@ -492,54 +520,54 @@ func (d *Database) CreateTables() error {
 	} else {
 		return fmt.Errorf("Unsupported database driver: %s", d.driverName)
 	}
-	return transact(d.db, operateOnTables, d, "ddl", "tables", normalPatternsType{tablePattern})
+	return operateOnTables(d.db, d, "ddl", "tables", normalPatternsType{tablePattern}, errorMode)
 }
 
 // CreateIndexes adds indexes to the data model tables.
 // SQL for the operation is obtained from the data-models-sqlalchemy service,
 // e.g. https://data-models-sqlalchemy.research.chop.edu/{Model}/{ModelVersion}/ddl/postgresql/indexes/.
-func (d *Database) CreateIndexes() error {
+func (d *Database) CreateIndexes(errorMode string) error {
 	var tablePattern string
 	if d.driverName == "postgres" {
 		tablePattern = `ON (\w+) \(`
 	} else {
 		return fmt.Errorf("Unsupported database driver: %s", d.driverName)
 	}
-	return transact(d.db, operateOnTables, d, "ddl", "indexes", normalPatternsType{tablePattern})
+	return operateOnTables(d.db, d, "ddl", "indexes", normalPatternsType{tablePattern}, errorMode)
 }
 
 // CreateConstraints adds integrity constraints to the data model tables.
 // SQL for the operation is obtained from the data-models-sqlalchemy service,
 // e.g. https://data-models-sqlalchemy.research.chop.edu/{Model}/{ModelVersion}/ddl/postgresql/constraints/.
-func (d *Database) CreateConstraints() error {
+func (d *Database) CreateConstraints(errorMode string) error {
 	var tablePattern string
 	if d.driverName == "postgres" {
 		tablePattern = `ALTER TABLE (\w+)`
 	} else {
 		return fmt.Errorf("Unsupported database driver: %s", d.driverName)
 	}
-	return transact(d.db, operateOnTables, d, "ddl", "constraints", normalPatternsType{tablePattern})
+	return operateOnTables(d.db, d, "ddl", "constraints", normalPatternsType{tablePattern}, errorMode)
 }
 
 // DropTables drops the data model tables.
 // Constraints and indexes should already have been dropped.
 // SQL for the operation is obtained from the data-models-sqlalchemy service, e.g.
 // https://data-models-sqlalchemy.research.chop.edu/{Model}/{ModelVersion}/drop/postgresql/tables/.
-func (d *Database) DropTables() error {
+func (d *Database) DropTables(errorMode string) error {
 	var tablePattern string
 	if d.driverName == "postgres" {
 		tablePattern = `DROP TABLE.* (\w+)`
 	} else {
 		return fmt.Errorf("Unsupported database driver: %s", d.driverName)
 	}
-	return transact(d.db, operateOnTables, d, "drop", "tables", normalPatternsType{tablePattern})
+	return operateOnTables(d.db, d, "drop", "tables", normalPatternsType{tablePattern}, errorMode)
 }
 
 // DropIndexes drops indexes from the data model tables.
 // For best performance, constraints should be dropped before dropping indexes.
 // SQL for the operation is obtained from the data-models-sqlalchemy service,
 // e.g. https://data-models-sqlalchemy.research.chop.edu/{Model}/{ModelVersion}/drop/postgresql/indexes/.
-func (d *Database) DropIndexes() error {
+func (d *Database) DropIndexes(errorMode string) error {
 	var createIndexTableNamePattern, createIndexIndexNamePattern, dropIndexIndexNamePattern string
 	if d.driverName == "postgres" {
 		createIndexTableNamePattern = ` ON (\w+) \(`
@@ -548,19 +576,19 @@ func (d *Database) DropIndexes() error {
 	} else {
 		return fmt.Errorf("Unsupported database driver: %s", d.driverName)
 	}
-	return transact(d.db, operateOnTables, d, "drop", "indexes", mapPatternsType{createIndexTableNamePattern, createIndexIndexNamePattern, dropIndexIndexNamePattern})
+	return operateOnTables(d.db, d, "drop", "indexes", mapPatternsType{createIndexTableNamePattern, createIndexIndexNamePattern, dropIndexIndexNamePattern}, errorMode)
 }
 
 // DropConstraints drops integrity constraints from the data model tables.
 // Constraints should be dropped before dropping indexes and tables.
 // SQL for the operation is obtained from the data-models-sqlalchemy service,
 // e.g. https://data-models-sqlalchemy.research.chop.edu/{Model}/{ModelVersion}/ddl/postgresql/constraints/.
-func (d *Database) DropConstraints() error {
+func (d *Database) DropConstraints(errorMode string) error {
 	var tablePattern string
 	if d.driverName == "postgres" {
 		tablePattern = `ALTER TABLE (\w+)`
 	} else {
 		return fmt.Errorf("Unsupported database driver: %s", d.driverName)
 	}
-	return transact(d.db, operateOnTables, d, "drop", "constraints", normalPatternsType{tablePattern})
+	return operateOnTables(d.db, d, "drop", "constraints", normalPatternsType{tablePattern}, errorMode)
 }

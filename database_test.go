@@ -33,7 +33,8 @@ var pedsnetVocabUrl = "http://github.com/infomodels/database/test_resources/peds
 // of http://data-models-service.research.chop.edu/.
 //
 // The optional variable `DT_VOCAB_URL` allows overriding the default of
-// http://github.com/infomodels/database/test_resources/pedsnet_vocab.tar.gz
+// http://github.com/infomodels/database/test_resources/pedsnet_vocab.tar.gz.
+// `DT_VOCAB_URL` can also be an absolute local file name.
 func NewTestEnv(t *testing.T) *TestEnv {
 
 	te := new(TestEnv)
@@ -67,9 +68,14 @@ func NewTestEnv(t *testing.T) *TestEnv {
 
 	var pedsnetVocabZipFile = filepath.Join(te.TempDir, "pedsnet_vocab.tar.gz")
 
-	if err = downloadFile(pedsnetVocabZipFile, pedsnetVocabUrl); err != nil {
-		t.Error(fmt.Sprintf("Failed to download '%s' to a temp file: %v", pedsnetVocabUrl, err))
-		t.FailNow()
+	if strings.HasPrefix(pedsnetVocabUrl, "http") {
+		if err = downloadFile(pedsnetVocabZipFile, pedsnetVocabUrl); err != nil {
+			t.Error(fmt.Sprintf("Failed to download '%s' to a temp file: %v", pedsnetVocabUrl, err))
+			t.FailNow()
+		}
+	} else {
+		// Assume DT_VOCAB_URL is an absolute local file name
+		os.Link(pedsnetVocabUrl, pedsnetVocabZipFile)
 	}
 
 	pedsnetVocabDataDirPath := filepath.Join(te.TempDir, "pedsnet_vocab")
@@ -130,8 +136,10 @@ func dropSchema(db *sql.DB, schema string) error {
 	return execSql(db, fmt.Sprintf("drop schema %s cascade", schema))
 }
 
-func testFunc(t *testing.T, f func() error, funcName string) {
-	if err := f(); err != nil {
+// assertNoErrors executes a database command with the passed error handling mode ("strict", "normal", or "force")
+// and fails if an error is returned
+func assertNoErrors(t *testing.T, f func(string) error, funcName string, errorMode string) {
+	if err := f(errorMode); err != nil {
 		t.Error(fmt.Sprintf("%s failed: %v", funcName, err))
 		t.FailNow()
 	}
@@ -216,7 +224,10 @@ func instantiateDataModel(t *testing.T, te *TestEnv, dataModel string, dataModel
 		t.FailNow()
 	}
 
-	testFunc(t, d.CreateTables, "CreateTables")
+	assertNoErrors(t, d.CreateTables, "CreateTables", "strict")
+	// And make sure that "normal" mode works: 'already exists' is benign:
+	assertNoErrors(t, d.CreateTables, "CreateTables", "normal")
+
 	tables := introspectTables(t, d.db, primarySchema(d.Schema))
 	if !mapContainsValues(tables, verifyTables) {
 		t.Error("Table creation failed:")
@@ -230,8 +241,12 @@ func instantiateDataModel(t *testing.T, te *TestEnv, dataModel string, dataModel
 	}
 
 	// TODO: verify these operations also:
-	testFunc(t, d.CreateIndexes, "CreateIndexes")
-	testFunc(t, d.CreateConstraints, "CreateConstraints")
+	assertNoErrors(t, d.CreateIndexes, "CreateIndexes", "strict")
+	// Ensure that double-creation of indexes doesn't cause an error in "normal" errorMode
+	assertNoErrors(t, d.CreateIndexes, "CreateIndexes", "normal")
+	assertNoErrors(t, d.CreateConstraints, "CreateConstraints", "strict")
+	// Ensure that double-creation of constraints doesn't cause an error in "normal" errorMode
+	assertNoErrors(t, d.CreateConstraints, "CreateConstraints", "normal")
 } // end func instantiateDataModel
 
 // Note: schema may be a comma-separated list of schemas, the first of which is primary, as in PostgreSQL
@@ -289,9 +304,12 @@ func destroyDataModel(t *testing.T, te *TestEnv, dataModel string, dataModelVers
 	defer d.Close()
 
 	// TODO: verify these operations
-	testFunc(t, d.DropConstraints, "DropConstraints")
-	testFunc(t, d.DropIndexes, "DropIndexes")
-	testFunc(t, d.DropTables, "DropTables")
+	assertNoErrors(t, d.DropConstraints, "DropConstraints", "strict")
+	assertNoErrors(t, d.DropConstraints, "DropConstraints", "normal")
+	assertNoErrors(t, d.DropIndexes, "DropIndexes", "strict")
+	assertNoErrors(t, d.DropIndexes, "DropIndexes", "normal")
+	assertNoErrors(t, d.DropTables, "DropTables", "strict")
+	assertNoErrors(t, d.DropTables, "DropTables", "normal")
 
 	if err = dropSchema(d.db, primarySchema(d.Schema)); err != nil {
 		t.Error(fmt.Sprintf("Warning: dropping test schema %s failed: %v", d.Schema, err))
