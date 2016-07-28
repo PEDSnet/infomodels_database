@@ -4,9 +4,10 @@ import (
 	"bytes"
 	"encoding/csv"
 	"fmt"
-	log "github.com/Sirupsen/logrus"
 	"github.com/infomodels/datadirectory"
 	"github.com/lib/pq" // PostgreSQL database driver
+	log "github.com/Sirupsen/logrus"
+  "io"
 	"os"
 	"os/exec"
 	"path"
@@ -30,6 +31,65 @@ func columnNamesFromCsvFile(fileName string) ([]string, error) {
 		return nil, fmt.Errorf("Error reading first row of `%s`: %v", fileName, err)
 	}
 	return record, nil
+}
+
+// lineCounter counts the number of physical text lines returned by a Reader.
+// See http://stackoverflow.com/a/24563853/390663.
+// As long as our csv files are not allowed to include newlines in
+// fields, this approach is legitimate. If the final line is not
+// terminated by a newline, it is still counted.
+func lineCounter(r io.Reader) (int, error) {
+	buf := make([]byte, 32*1024)
+	count := 0
+	lineSep := []byte{'\n'}
+  var lastByte byte
+  lastByte = '\n'
+  
+	for {
+		c, err := r.Read(buf)
+    if c > 0 {
+      lastByte = buf[c - 1]
+    }
+		count += bytes.Count(buf[:c], lineSep)
+
+		switch {
+		case err == io.EOF:
+			if lastByte != '\n' {
+        log.Warn(fmt.Sprintf("Last byte in buffer is '%v'", lastByte))
+				count += 1
+			}
+			return count, nil
+
+		case err != nil:
+			return count, err
+		}
+	}
+}
+
+// rowsInFile returns the number of physical lines in a file.
+func rowsInFile(fileName string) (int, error) {
+	fileReader, err := os.Open(fileName)
+	if err != nil {
+		return 0, err
+	}
+	defer fileReader.Close()
+	return lineCounter(fileReader)
+}
+
+func rowsInTable(conn_str string, schema string, table string) (int, error) {
+	var count int
+  // TODO: pass in the driver name
+  db, err := openDatabase("postgres", conn_str)
+  if err != nil {
+    return 0, err
+  }
+  
+	sql := fmt.Sprintf("select count(*) as count from %s.%s", schema, table)
+	err = db.QueryRow(sql).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("Can't get count of %s.%s table: %v", schema, table, err)
+	}
+	return count, nil
 }
 
 type CopyCommandArgs struct {
@@ -64,14 +124,34 @@ func copyCommand(databaseUrl string, schema string, table string, csvFile string
 	cmdStr := fmt.Sprintf(`psql "%s" -c "\COPY %s.%s(%s) FROM '%s' (FORMAT csv, HEADER true, ENCODING 'utf-8', FORCE_NULL(%s))"`, connectionString, schema, table, columns, csvFile, columns)
 
 	cmd := exec.Command("sh", "-c", cmdStr)
+  
 	var e bytes.Buffer
 	cmd.Stderr = &e
+
 	err = cmd.Run()
 	if err != nil {
 		return fmt.Errorf("Error running command with `sh -c`: %v (STDERR: %s)", cmdStr, err, string(e.Bytes()))
-	} else {
-		log.Info(fmt.Sprintf("Loaded %s.%s", schema, table))
 	}
+
+	actualRows, err := rowsInTable(connectionString, schema, table)
+  if err != nil {
+		return fmt.Errorf("Load for %s.%s nominally worked, but counting the number of rows failed: %v", schema, table, err)
+	}
+
+	expectedRows, err := rowsInFile(csvFile)
+  expectedRows -= 1   // Account for header
+  if err != nil {
+		return fmt.Errorf("Load for %s.%s nominally worked, but counting the number of lines in the csv file failed: %v", schema, table, err)
+	}
+
+	if actualRows != expectedRows {
+    err = fmt.Errorf("Number of rows in %s.%s (%d) does not equal the number of lines (%d) in the input file", schema, table, actualRows, expectedRows)
+    log.Error(fmt.Sprintf("In copyCommand: %v", err))
+		return err
+	}
+
+	log.Info(fmt.Sprintf("Loaded %d rows into %s.%s", actualRows, schema, table))
+
 	return nil
 }
 
