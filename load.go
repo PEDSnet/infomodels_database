@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"encoding/csv"
 	"fmt"
+	log "github.com/Sirupsen/logrus"
 	"github.com/infomodels/datadirectory"
 	"github.com/lib/pq" // PostgreSQL database driver
-	log "github.com/Sirupsen/logrus"
-  "io"
+	"io"
 	"os"
 	"os/exec"
 	"path"
@@ -42,20 +42,20 @@ func lineCounter(r io.Reader) (int, error) {
 	buf := make([]byte, 32*1024)
 	count := 0
 	lineSep := []byte{'\n'}
-  var lastByte byte
-  lastByte = '\n'
-  
+	var lastByte byte
+	lastByte = '\n'
+
 	for {
 		c, err := r.Read(buf)
-    if c > 0 {
-      lastByte = buf[c - 1]
-    }
+		if c > 0 {
+			lastByte = buf[c-1]
+		}
 		count += bytes.Count(buf[:c], lineSep)
 
 		switch {
 		case err == io.EOF:
 			if lastByte != '\n' {
-        log.Warn(fmt.Sprintf("Last byte in buffer is '%v'", lastByte))
+				log.Warn(fmt.Sprintf("Last byte in buffer is '%v'", lastByte))
 				count += 1
 			}
 			return count, nil
@@ -78,18 +78,37 @@ func rowsInFile(fileName string) (int, error) {
 
 func rowsInTable(conn_str string, schema string, table string) (int, error) {
 	var count int
-  // TODO: pass in the driver name
-  db, err := openDatabase("postgres", conn_str)
-  if err != nil {
-    return 0, err
-  }
-  
+	// TODO: pass in the driver name
+	db, err := openDatabase("postgres", conn_str)
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+
 	sql := fmt.Sprintf("select count(*) as count from %s.%s", schema, table)
 	err = db.QueryRow(sql).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("Can't get count of %s.%s table: %v", schema, table, err)
 	}
 	return count, nil
+}
+
+func analyze(conn_str string, schema string, table string) error {
+	// TODO: pass in the driver name
+	// TODO: must check driver name and only do vacuum if postgresql
+	db, err := openDatabase("postgres", conn_str)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	sql := fmt.Sprintf("VACUUM FREEZE ANALYZE %s.%s", schema, table)
+	_, err = db.Exec(sql)
+	if err != nil {
+		return fmt.Errorf("Error executing `%s`: %v", sql, err)
+	}
+
+	return nil
 }
 
 type CopyCommandArgs struct {
@@ -104,6 +123,8 @@ type CopyCommandArgs struct {
 // CSV files are assumed to be named {table}.csv within a top-level directory in the zip file.
 // The column names are first extracted from the CSV file so we assign columns in the CSV file to the correct columns in the table.
 func copyCommand(databaseUrl string, schema string, table string, csvFile string, wg sync.WaitGroup) error {
+
+	log.Info(fmt.Sprintf("Loading %s.%s", schema, table))
 
 	columnNames, err := columnNamesFromCsvFile(csvFile)
 	if err != nil {
@@ -124,7 +145,7 @@ func copyCommand(databaseUrl string, schema string, table string, csvFile string
 	cmdStr := fmt.Sprintf(`psql "%s" -c "\COPY %s.%s(%s) FROM '%s' (FORMAT csv, HEADER true, ENCODING 'utf-8', FORCE_NULL(%s))"`, connectionString, schema, table, columns, csvFile, columns)
 
 	cmd := exec.Command("sh", "-c", cmdStr)
-  
+
 	var e bytes.Buffer
 	cmd.Stderr = &e
 
@@ -134,23 +155,25 @@ func copyCommand(databaseUrl string, schema string, table string, csvFile string
 	}
 
 	actualRows, err := rowsInTable(connectionString, schema, table)
-  if err != nil {
+	if err != nil {
 		return fmt.Errorf("Load for %s.%s nominally worked, but counting the number of rows failed: %v", schema, table, err)
 	}
 
 	expectedRows, err := rowsInFile(csvFile)
-  expectedRows -= 1   // Account for header
-  if err != nil {
+	expectedRows -= 1 // Account for header
+	if err != nil {
 		return fmt.Errorf("Load for %s.%s nominally worked, but counting the number of lines in the csv file failed: %v", schema, table, err)
 	}
 
 	if actualRows != expectedRows {
-    err = fmt.Errorf("Number of rows in %s.%s (%d) does not equal the number of lines (%d) in the input file", schema, table, actualRows, expectedRows)
-    log.Error(fmt.Sprintf("In copyCommand: %v", err))
+		err = fmt.Errorf("Number of rows in %s.%s (%d) does not equal the number of lines (%d) in the input file", schema, table, actualRows, expectedRows)
+		log.Error(fmt.Sprintf("In copyCommand: %v", err))
 		return err
 	}
 
 	log.Info(fmt.Sprintf("Loaded %d rows into %s.%s", actualRows, schema, table))
+
+	log.Info(fmt.Sprintf("Vacuuming %s.%s", schema, table))
 
 	return nil
 }
