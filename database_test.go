@@ -14,8 +14,8 @@ import (
 )
 
 type TestEnv struct {
-	DatabaseUrl, Schema, DmsaUrl, DmUrl, Model, ModelVersion, TempDir string
-	PedsnetVocabDataDir                                               *datadirectory.DataDirectory
+	DatabaseUrl, SearchPath, DmsaUrl, DmUrl, Model, ModelVersion, TempDir string
+	PedsnetVocabDataDir                                                   *datadirectory.DataDirectory
 }
 
 // A zip file containing some test vocab data
@@ -184,8 +184,8 @@ func mapContainsValues(has map[string]bool, values []string) bool {
 var pedsnetVocabDataModel string = "pedsnet-vocab"
 var pedsnetCoreDataModel string = "pedsnet-core"
 var pedsnetDataModelVersion string = "2.2.0"
-var pedsnetVocabSchema string = "dt_pedsnet_vocab"
-var pedsnetCoreSchema string = "dt_pedsnet_core,dt_pedsnet_vocab"
+var pedsnetVocabSearchPath string = "dt_pedsnet_vocab"
+var pedsnetCoreSearchPath string = "dt_pedsnet_core,dt_pedsnet_vocab"
 
 // // keysInMap returns a slice containing the keys from a map whose keys are strings.
 // func keysInMap(m map[string]string) []string {
@@ -198,29 +198,25 @@ var pedsnetCoreSchema string = "dt_pedsnet_core,dt_pedsnet_vocab"
 //   return keys
 // }
 
-// primarySchema returns the primary schema of a PostgreSQL-style comma-separated searchpath.
-func primarySchema(searchPath string) string {
-	var primarySchema = searchPath
-	schemas := strings.Split(searchPath, ",")
-	if len(schemas) > 0 {
-		primarySchema = schemas[0]
-	}
-	return primarySchema
-}
-
-// Note: schema may be a comma-separated list of schemas, the first of which is primary, as in PostgreSQL
-func instantiateDataModel(t *testing.T, te *TestEnv, dataModel string, dataModelVersion string, schema string, verifyTables []string, shouldLoad bool) {
+// Note: searchPath may be a comma-separated list of schemas, the first of which is primary, as in PostgreSQL
+func instantiateDataModel(t *testing.T, te *TestEnv, dataModel string, dataModelVersion string, searchPath string, verifyTables []string, shouldLoad bool) {
 	var (
 		err error
 		d   *Database
 	)
-	if d, err = Open(dataModel, dataModelVersion, te.DatabaseUrl, schema, te.DmsaUrl, "", ""); err != nil {
+	if d, err = Open(dataModel, dataModelVersion, te.DatabaseUrl, searchPath, te.DmsaUrl, "", ""); err != nil {
 		t.Error(fmt.Sprintf("Open failed: %v", err))
 		t.FailNow()
 	}
 	defer d.Close()
 
-	if err = createSchema(d.db, primarySchema(schema)); err != nil {
+	primarySchema, err := primarySchemaInSearchPath(searchPath)
+	if err != nil {
+		t.Error(err.Error())
+		t.FailNow()
+	}
+
+	if err = createSchema(d.db, primarySchema); err != nil {
 		t.Error(fmt.Sprintf("Tests require the ability to create schemas: %v", err))
 		t.FailNow()
 	}
@@ -229,7 +225,7 @@ func instantiateDataModel(t *testing.T, te *TestEnv, dataModel string, dataModel
 	// And make sure that "normal" mode works: 'already exists' is benign:
 	assertNoErrors(t, d.CreateTables, "CreateTables", "normal")
 
-	tables := introspectTables(t, d.db, primarySchema(d.Schema))
+	tables := introspectTables(t, d.db, primarySchema)
 	if !mapContainsValues(tables, verifyTables) {
 		t.Error("Table creation failed:")
 		t.Error(fmt.Sprintf("Expected tables: %v", verifyTables))
@@ -238,7 +234,7 @@ func instantiateDataModel(t *testing.T, te *TestEnv, dataModel string, dataModel
 	}
 
 	if shouldLoad {
-		loadDataModel(t, te, pedsnetVocabDataModel, pedsnetDataModelVersion, pedsnetVocabSchema, verifyTables)
+		loadDataModel(t, te, pedsnetVocabDataModel, pedsnetDataModelVersion, pedsnetVocabSearchPath, verifyTables)
 	}
 
 	// TODO: verify these operations also:
@@ -250,13 +246,14 @@ func instantiateDataModel(t *testing.T, te *TestEnv, dataModel string, dataModel
 	assertNoErrors(t, d.CreateConstraints, "CreateConstraints", "normal")
 } // end func instantiateDataModel
 
-// Note: schema may be a comma-separated list of schemas, the first of which is primary, as in PostgreSQL
-func loadDataModel(t *testing.T, te *TestEnv, dataModel string, dataModelVersion string, schema string, verifyTables []string) {
+// Note: searchPath may be a comma-separated list of schemas, the first of which is primary, as in PostgreSQL
+func loadDataModel(t *testing.T, te *TestEnv, dataModel string, dataModelVersion string, searchPath string, verifyTables []string) {
 	var (
-		err error
-		d   *Database
+		err           error
+		d             *Database
+		primarySchema string
 	)
-	if d, err = Open(dataModel, dataModelVersion, te.DatabaseUrl, schema, te.DmsaUrl, "", ""); err != nil {
+	if d, err = Open(dataModel, dataModelVersion, te.DatabaseUrl, searchPath, te.DmsaUrl, "", ""); err != nil {
 		t.Error(fmt.Sprintf("Open failed: %v", err))
 		t.FailNow()
 	}
@@ -264,8 +261,14 @@ func loadDataModel(t *testing.T, te *TestEnv, dataModel string, dataModelVersion
 
 	d.Load(te.PedsnetVocabDataDir)
 
+	primarySchema, err = primarySchemaInSearchPath(searchPath)
+	if err != nil {
+		t.Error(err.Error())
+		t.FailNow()
+	}
+
 	var count int
-	sql := fmt.Sprintf("select count(*) as count from %s.concept", schema)
+	sql := fmt.Sprintf("select count(*) as count from %s.concept", primarySchema)
 	err = d.db.QueryRow(sql).Scan(&count)
 	if err != nil {
 		t.Error(fmt.Sprintf("Can't get count of concept table: %v", err))
@@ -280,7 +283,7 @@ func loadDataModel(t *testing.T, te *TestEnv, dataModel string, dataModelVersion
 
 func instantiatePedsnetVocab(t *testing.T, te *TestEnv) {
 	verifyTables := []string{"concept", "concept_ancestor", "concept_class", "concept_relationship", "concept_synonym", "domain", "drug_strength", "relationship", "source_to_concept_map", "version_history", "vocabulary"}
-	instantiateDataModel(t, te, pedsnetVocabDataModel, pedsnetDataModelVersion, pedsnetVocabSchema, verifyTables, true)
+	instantiateDataModel(t, te, pedsnetVocabDataModel, pedsnetDataModelVersion, pedsnetVocabSearchPath, verifyTables, true)
 }
 
 func instantiatePedsnetCore(t *testing.T, te *TestEnv) {
@@ -302,15 +305,15 @@ func instantiatePedsnetCore(t *testing.T, te *TestEnv) {
 		"visit_occurrence",
 		"visit_payer",
 	}
-	instantiateDataModel(t, te, pedsnetCoreDataModel, pedsnetDataModelVersion, pedsnetCoreSchema, verifyTables, false)
+	instantiateDataModel(t, te, pedsnetCoreDataModel, pedsnetDataModelVersion, pedsnetCoreSearchPath, verifyTables, false)
 }
 
-func destroyDataModel(t *testing.T, te *TestEnv, dataModel string, dataModelVersion string, schema string) {
+func destroyDataModel(t *testing.T, te *TestEnv, dataModel string, dataModelVersion string, searchPath string) {
 	var (
 		err error
 		d   *Database
 	)
-	if d, err = Open(dataModel, dataModelVersion, te.DatabaseUrl, schema, te.DmsaUrl, "", ""); err != nil {
+	if d, err = Open(dataModel, dataModelVersion, te.DatabaseUrl, searchPath, te.DmsaUrl, "", ""); err != nil {
 		t.Error(fmt.Sprintf("Open failed: %v", err))
 		t.FailNow()
 	}
@@ -324,18 +327,24 @@ func destroyDataModel(t *testing.T, te *TestEnv, dataModel string, dataModelVers
 	assertNoErrors(t, d.DropTables, "DropTables", "strict")
 	assertNoErrors(t, d.DropTables, "DropTables", "normal")
 
-	if err = dropSchema(d.db, primarySchema(d.Schema)); err != nil {
-		t.Error(fmt.Sprintf("Warning: dropping test schema %s failed: %v", d.Schema, err))
+	primarySchema, err := primarySchemaInSearchPath(d.SearchPath)
+	if err != nil {
+		t.Error(err.Error())
+		t.FailNow()
+	}
+
+	if err = dropSchema(d.db, primarySchema); err != nil {
+		t.Error(fmt.Sprintf("Warning: dropping test schema %s failed: %v", primarySchema, err))
 		t.FailNow()
 	}
 }
 
 func destroyPedsnetVocab(t *testing.T, te *TestEnv) {
-	destroyDataModel(t, te, pedsnetVocabDataModel, pedsnetDataModelVersion, pedsnetVocabSchema)
+	destroyDataModel(t, te, pedsnetVocabDataModel, pedsnetDataModelVersion, pedsnetVocabSearchPath)
 }
 
 func destroyPedsnetCore(t *testing.T, te *TestEnv) {
-	destroyDataModel(t, te, pedsnetCoreDataModel, pedsnetDataModelVersion, pedsnetCoreSchema)
+	destroyDataModel(t, te, pedsnetCoreDataModel, pedsnetDataModelVersion, pedsnetCoreSearchPath)
 }
 
 // TestPedsnetInParts tests the 'pedsnet-core' data model, which is

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	log "github.com/Sirupsen/logrus"
+	"github.com/lib/pq"
 	"io/ioutil"
 	"net/http"
 	"net/url"
@@ -27,7 +28,7 @@ type Database struct {
 	Model        string // Model per https://github.com/chop-dbhi/data-models.
 	ModelVersion string // Model version per https://github.com/chop-dbhi/data-models.
 	DatabaseUrl  string // Better would be `DB *sql.DB`, but that is not adequate for loading data the way we will do it initially.
-	Schema       string // This is needed for PostgreSQL if a suitable search_path is not being set automatically per database or user. This may be a *comma-separated list of schemas*.
+	SearchPath   string // This is needed for PostgreSQL if a suitable search_path is not being set automatically per database or user. This may be a comma-separated list of schemas.
 	DmsaUrl      string // data-models-sqlalchemy base URL, or "" for the default. The URL should include the database name.
 
 	db            *sql.DB        // Database handle?
@@ -57,8 +58,99 @@ func joinUrlPath(base string, path string) string {
 	}
 }
 
-func openDatabase(driverName string, databaseUrl string) (*sql.DB, error) {
-	db, err := sql.Open(driverName, databaseUrl)
+// driverNameFromUrl returns a driver name (derived from the scheme) from a database URI.
+func driverNameFromUrl(urlString string) (string, error) {
+	url, err := url.Parse(urlString)
+	if err != nil {
+		return "", fmt.Errorf("Invalid URL '%s': %v", urlString, err)
+	}
+	if url.Scheme == "postgres" || url.Scheme == "postgresql" {
+		return "postgres", nil
+	} else {
+		return "", fmt.Errorf("Unsupported database scheme '%s'", url.Scheme)
+	}
+}
+
+// unpackDatabaseUrl - unpack a database URL into a map of key/value pairs, per https://godoc.org/github.com/lib/pq.
+func unpackDatabaseUrl(url string) (urlComponents map[string]string, err error) {
+	connectionString, err := pq.ParseURL(url)
+	if err != nil {
+		err = fmt.Errorf("Invalid database URL: %v", url)
+		return
+	}
+
+	urlComponents = make(map[string]string)
+	pairs := strings.Split(connectionString, " ")
+	for _, pair := range pairs {
+		pairSlice := strings.Split(pair, "=")
+		urlComponents[pairSlice[0]] = pairSlice[1]
+	}
+
+	return
+}
+
+// newDatabaseConnectionString - return libpq-style connection string usable by sql.Open with the postgres driver.
+func newDatabaseConnectionString(urlComponents map[string]string) string {
+	var pairs []string
+	for key, value := range urlComponents {
+		pairs = append(pairs, key+"="+value)
+	}
+
+	return strings.Join(pairs, " ")
+}
+
+// connectionStringFromDbUriAndSearchPath returns a connection string usable by the `pq` driver including search_path.
+// TODO: We assume that the databaseUrl does not contain a
+// search_path.  If the user passes in a libpq-compliant URI that
+// includes search_path in the options, our override may or may not
+// work, depending on how `pq` is implemented. We take advantage of a
+// `pq` driver extension, which is the ability to include search_path
+// in the top level of the connection string.
+func connectionStringFromDbUriAndSearchPath(databaseUrl string, searchPath string) (string, error) {
+	connMap, err := unpackDatabaseUrl(databaseUrl)
+	if err != nil {
+		return "", err
+	}
+
+	connMap["search_path"] = searchPath
+
+	return newDatabaseConnectionString(connMap), nil
+}
+
+// primarySchemaInPath returns the first schema in a PostgreSQL search path.
+func primarySchemaInSearchPath(searchPath string) (string, error) {
+	schemas := strings.Split(searchPath, ",")
+	if len(schemas) == 0 {
+		return "", fmt.Errorf("search path should not be empty")
+	}
+	schema := strings.TrimSpace(schemas[0])
+	if len(schema) == 0 {
+		return "", fmt.Errorf("first schema in search path should not be empty")
+	}
+	return schema, nil
+}
+
+// OpenDatabase is a low-level function that opens a database using a DBURI and sets a search_path for the connection.
+func OpenDatabase(databaseUrl string, searchPath string) (*sql.DB, error) {
+
+	var (
+		connStr    string
+		driverName string
+		err        error
+		db         *sql.DB
+	)
+
+	connStr, err = connectionStringFromDbUriAndSearchPath(databaseUrl, searchPath)
+	if err != nil {
+		return nil, err
+	}
+
+	driverName, err = driverNameFromUrl(databaseUrl)
+	if err != nil {
+		return nil, err
+	}
+
+	db, err = sql.Open(driverName, connStr)
 	if err != nil {
 		return db, fmt.Errorf("Error opening %s: %v", databaseUrl, err)
 	}
@@ -380,16 +472,6 @@ func operateOnTables(db *sql.DB, args ...interface{}) (lastError error) {
 		return err
 	}
 
-	if d.Schema != "" {
-		if d.driverName == "postgres" {
-			if err = executeSQL(db, fmt.Sprintf("SET search_path TO %s", d.Schema)); err != nil {
-				return err
-			}
-		} else {
-			return fmt.Errorf("Schemas are currently supported only for PostgreSQL")
-		}
-	}
-
 	for _, stmt := range stmts {
 		if err = executeSQL(db, stmt); err != nil {
 			lastError = fmt.Errorf("Error executing SQL: `%v`: %v", stmt, err)
@@ -423,19 +505,6 @@ func operateOnTables(db *sql.DB, args ...interface{}) (lastError error) {
 	return nil
 } // end func operateOnTables
 
-// driverNameFromUrl returns a driver name (derived from the scheme) from a database URL
-func driverNameFromUrl(urlString string) (string, error) {
-	url, err := url.Parse(urlString)
-	if err != nil {
-		return "", fmt.Errorf("Invalid URL '%s': %v", urlString, err)
-	}
-	if url.Scheme == "postgres" || url.Scheme == "postgresql" {
-		return "postgres", nil
-	} else {
-		return "", fmt.Errorf("Unsupported database scheme '%s'", url.Scheme)
-	}
-}
-
 // versionMatchesMinorVersion returns true if a version X.Y.Z has X.Y matching a reference version A.B.
 func versionMatchesMinorVersion(version string, referenceMinorVersion string) bool {
 	parts := strings.Split(version, ".")
@@ -443,7 +512,7 @@ func versionMatchesMinorVersion(version string, referenceMinorVersion string) bo
 }
 
 // Open is the constructor for the Database object; it validates properties and opens a connection to the database.
-func Open(model string, modelVersion string, databaseUrl string, schema string, dmsaUrl string, includeTablesPat string, excludeTablesPat string) (*Database, error) {
+func Open(model string, modelVersion string, databaseUrl string, searchPath string, dmsaUrl string, includeTablesPat string, excludeTablesPat string) (*Database, error) {
 	var err error
 
 	if dmsaUrl == "" {
@@ -483,17 +552,18 @@ func Open(model string, modelVersion string, databaseUrl string, schema string, 
 		}
 	}
 
-	d := &Database{Model: model, ModelVersion: modelVersion, DatabaseUrl: databaseUrl, Schema: schema, DmsaUrl: dmsaUrl, includeTables: includeTables, excludeTables: excludeTables}
+	driverName, err := driverNameFromUrl(databaseUrl)
+	if err != nil {
+		return nil, fmt.Errorf("Open of database failed: %v", err)
+	}
+
+	d := &Database{Model: model, ModelVersion: modelVersion, DatabaseUrl: databaseUrl, SearchPath: searchPath, DmsaUrl: dmsaUrl, driverName: driverName, includeTables: includeTables, excludeTables: excludeTables}
 
 	if err = d.checkModelAndVersion(); err != nil {
 		return nil, err
 	}
 
-	if d.driverName, err = driverNameFromUrl(databaseUrl); err != nil {
-		return nil, err
-	}
-
-	if d.db, err = openDatabase(d.driverName, d.DatabaseUrl); err != nil {
+	if d.db, err = OpenDatabase(d.DatabaseUrl, searchPath); err != nil {
 		return nil, err
 	}
 

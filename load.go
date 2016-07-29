@@ -76,27 +76,25 @@ func rowsInFile(fileName string) (int, error) {
 	return lineCounter(fileReader)
 }
 
-func rowsInTable(conn_str string, schema string, table string) (int, error) {
+func rowsInTable(databaseUrl string, searchPath string, table string) (int, error) {
 	var count int
-	// TODO: pass in the driver name
-	db, err := openDatabase("postgres", conn_str)
+	db, err := OpenDatabase(databaseUrl, searchPath)
 	if err != nil {
 		return 0, err
 	}
 	defer db.Close()
 
-	sql := fmt.Sprintf("select count(*) as count from %s.%s", schema, table)
+	sql := fmt.Sprintf("select count(*) as count from %s", table)
 	err = db.QueryRow(sql).Scan(&count)
 	if err != nil {
-		return 0, fmt.Errorf("Can't get count of %s.%s table: %v", schema, table, err)
+		return 0, fmt.Errorf("Can't get count of table `%s` (search_path `%s`): %v", table, searchPath, err)
 	}
 	return count, nil
 }
 
-func analyze(conn_str string, schema string, table string) error {
-	// TODO: pass in the driver name
-	// TODO: must check driver name and only do vacuum if postgresql
-	db, err := openDatabase("postgres", conn_str)
+func analyze(databaseUrl string, schema string, table string) error {
+	// TODO: should check driver name and only do vacuum if postgresql
+	db, err := OpenDatabase(databaseUrl, "")
 	if err != nil {
 		return err
 	}
@@ -113,7 +111,7 @@ func analyze(conn_str string, schema string, table string) error {
 
 type CopyCommandArgs struct {
 	DatabaseUrl string
-	Schema      string
+	SearchPath  string
 	Table       string
 	CsvFile     string
 	WaitGroup   sync.WaitGroup
@@ -122,9 +120,9 @@ type CopyCommandArgs struct {
 // copyCommand returns an exec.Command for loading a CSV data file into a database using `psql` via the shell.
 // CSV files are assumed to be named {table}.csv within a top-level directory in the zip file.
 // The column names are first extracted from the CSV file so we assign columns in the CSV file to the correct columns in the table.
-func copyCommand(databaseUrl string, schema string, table string, csvFile string, wg sync.WaitGroup) error {
+func copyCommand(databaseUrl string, searchPath string, table string, csvFile string, wg sync.WaitGroup) error {
 
-	log.Info(fmt.Sprintf("Loading %s.%s", schema, table))
+	log.Info(fmt.Sprintf("Loading %s (search_path: %s)", table, searchPath))
 
 	columnNames, err := columnNamesFromCsvFile(csvFile)
 	if err != nil {
@@ -137,12 +135,18 @@ func copyCommand(databaseUrl string, schema string, table string, csvFile string
 
 	columns := strings.Join(columnNames, ", ")
 
+	// The connection string to be used by psql.
 	connectionString, err := pq.ParseURL(databaseUrl)
 	if err != nil {
 		return fmt.Errorf("Invalid database URL: %v", databaseUrl)
 	}
 
-	cmdStr := fmt.Sprintf(`psql "%s" -c "\COPY %s.%s(%s) FROM '%s' (FORMAT csv, HEADER true, ENCODING 'utf-8', FORCE_NULL(%s))"`, connectionString, schema, table, columns, csvFile, columns)
+	primarySchema, err := primarySchemaInSearchPath(searchPath)
+	if err != nil {
+		return err
+	}
+
+	cmdStr := fmt.Sprintf(`psql "%s" -c "\COPY %s.%s(%s) FROM '%s' (FORMAT csv, HEADER true, ENCODING 'utf-8', FORCE_NULL(%s))"`, connectionString, primarySchema, table, columns, csvFile, columns)
 
 	cmd := exec.Command("sh", "-c", cmdStr)
 
@@ -154,26 +158,27 @@ func copyCommand(databaseUrl string, schema string, table string, csvFile string
 		return fmt.Errorf("Error running command with `sh -c`: %v (STDERR: %s)", cmdStr, err, string(e.Bytes()))
 	}
 
-	actualRows, err := rowsInTable(connectionString, schema, table)
+	actualRows, err := rowsInTable(databaseUrl, searchPath, table)
 	if err != nil {
-		return fmt.Errorf("Load for %s.%s nominally worked, but counting the number of rows failed: %v", schema, table, err)
+		return fmt.Errorf("Load for %s.%s nominally worked, but counting the number of rows failed: %v", primarySchema, table, err)
 	}
 
 	expectedRows, err := rowsInFile(csvFile)
 	expectedRows -= 1 // Account for header
 	if err != nil {
-		return fmt.Errorf("Load for %s.%s nominally worked, but counting the number of lines in the csv file failed: %v", schema, table, err)
+		return fmt.Errorf("Load for %s.%s nominally worked, but counting the number of lines in the csv file failed: %v", primarySchema, table, err)
 	}
 
 	if actualRows != expectedRows {
-		err = fmt.Errorf("Number of rows in %s.%s (%d) does not equal the number of lines (%d) in the input file", schema, table, actualRows, expectedRows)
+		err = fmt.Errorf("Number of rows in %s.%s (%d) does not equal the number of lines (%d) in the input file", primarySchema, table, actualRows, expectedRows)
 		log.Error(fmt.Sprintf("In copyCommand: %v", err))
 		return err
 	}
 
-	log.Info(fmt.Sprintf("Loaded %d rows into %s.%s", actualRows, schema, table))
+	log.Info(fmt.Sprintf("Loaded %d rows into %s.%s", actualRows, primarySchema, table))
 
-	log.Info(fmt.Sprintf("Vacuuming %s.%s", schema, table))
+	log.Info(fmt.Sprintf("Vacuuming %s.%s", primarySchema, table))
+	analyze(databaseUrl, primarySchema, table)
 
 	return nil
 }
@@ -220,7 +225,7 @@ func (d *Database) load(datadirectory *datadirectory.DataDirectory) error {
 		wg.Add(1)
 		go func(n int) {
 			for args := range tasks {
-				err := copyCommand(args.DatabaseUrl, args.Schema, args.Table, args.CsvFile, args.WaitGroup)
+				err := copyCommand(args.DatabaseUrl, args.SearchPath, args.Table, args.CsvFile, args.WaitGroup)
 				if err != nil {
 					taskErrors <- err
 				}
@@ -236,7 +241,7 @@ func (d *Database) load(datadirectory *datadirectory.DataDirectory) error {
 		fileName := path.Join(datadirectory.DirPath, m["filename"])
 		copyArgs := &CopyCommandArgs{
 			DatabaseUrl: d.DatabaseUrl,
-			Schema:      d.Schema,
+			SearchPath:  d.SearchPath,
 			Table:       table,
 			CsvFile:     fileName,
 			WaitGroup:   wg}
