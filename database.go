@@ -218,38 +218,6 @@ func (d *Database) checkModelAndVersion() error {
 	return nil
 }
 
-// Transact wraps database activity in a transaction.
-// Stolen from http://stackoverflow.com/a/23502629/390663
-func transact(db *sql.DB, txFunc func(*sql.Tx, ...interface{}) error, args ...interface{}) (err error) {
-	var tx *sql.Tx
-	if db != nil {
-		tx, err = db.Begin()
-		if err != nil {
-			return
-		}
-	}
-	defer func() {
-		if p := recover(); p != nil {
-			switch p := p.(type) {
-			case error:
-				err = p
-			default:
-				err = fmt.Errorf("%s", p)
-			}
-		}
-		if err != nil {
-			if tx != nil {
-				tx.Rollback()
-			}
-			return
-		}
-		if tx != nil {
-			err = tx.Commit()
-		}
-	}()
-	return txFunc(tx, args...)
-}
-
 // execute runs a SQL statement within a transaction `tx` or prints the SQL
 // on stdout if db is nil.  Leading whitespace is stripped, for clean logs.
 func executeSQL(db *sql.DB, sql string) error {
@@ -257,7 +225,7 @@ func executeSQL(db *sql.DB, sql string) error {
 	if db == nil {
 		fmt.Printf("%s;\n", sql)
 	} else {
-		//    fmt.Printf("%s;\n", sql)
+		log.Info(fmt.Printf("executeSQL: %s", sql))
 		if _, err := db.Exec(sql); err != nil {
 			return fmt.Errorf("Error executing SQL: %v: %v", sql, err)
 		}
@@ -451,12 +419,12 @@ func dmsaSql(d *Database, ddlOperator string, ddlOperand string, patterns interf
 //  * a struct containing pattern strings, of type normalPatternsType or mapPatternsType.
 //  * and an error sensitivity level: "normal" (ignore "does not exist" and "already exists" errors), "strict" (ignore no errors) or "force" (ignore all errors)
 //
-// When errors occur, they are logged.
+// All statements are executed regardless of success or failure, and all errors are logged at error level.
 //
 // TODO: the whole SQL execution pattern should be rewritten to follow Aaron's Python module.
 //
 // See also dmsaSql.
-func operateOnTables(db *sql.DB, args ...interface{}) (lastError error) {
+func operateOnTables(db *sql.DB, args ...interface{}) error {
 	var (
 		err          error
 		d            *Database = args[0].(*Database)
@@ -471,36 +439,40 @@ func operateOnTables(db *sql.DB, args ...interface{}) (lastError error) {
 	if err != nil {
 		return err
 	}
+	log.Info(fmt.Sprintf("num stmts = %d", len(stmts)))
+
+	var errors []error
 
 	for _, stmt := range stmts {
 		if err = executeSQL(db, stmt); err != nil {
-			lastError = fmt.Errorf("Error executing SQL: `%v`: %v", stmt, err)
-			if errorMode == "force" {
-				// Ignore this error
-			} else if errorMode == "normal" {
+			errors = append(errors, err)
+		}
+	} // end for all SQL statements
+
+	var fatal bool
+
+	if errorMode != "force" {
+		for _, err = range errors {
+			if errorMode == "normal" {
 				// Maybe tolerate this error
 				errStr := err.Error()
 				if strings.Contains(errStr, "already exists") || strings.Contains(errStr, "does not exist") {
-					// Ignore this error
+					log.Debug(fmt.Sprintf("ignoring error: %v", err))
 				} else {
-					// This error is fatal
-					log.Error(lastError.Error())
-					return
+					log.Error(fmt.Sprintf("fatal error: %v", err))
+					fatal = true
 				}
 			} else if errorMode == "strict" {
-				// This error is fatal
-				log.Error(lastError.Error())
-				return
+				log.Error(fmt.Sprintf("fatal error: %v", err))
+				fatal = true
 			} else {
 				return fmt.Errorf("Invalid error mode: %s", errorMode)
 			}
 		}
-	} // end for all SQL statements
+	}
 
-	// Assert: any errors were ignored, so we want to log but return nil
-	if lastError != nil {
-		lastError = fmt.Errorf("Ignored one or more errors according to the error mode. Last error was as follows: %s", lastError.Error())
-		log.Warn(lastError.Error())
+	if fatal {
+		return fmt.Errorf("one or more fatal errors during %s-%s; see error messages in log", ddlOperation, ddlOperand)
 	}
 	return nil
 } // end func operateOnTables
