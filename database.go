@@ -4,6 +4,8 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	log "github.com/Sirupsen/logrus"
+	"github.com/lib/pq"
 	"io/ioutil"
 	"net/http"
 	"net/url"
@@ -26,7 +28,7 @@ type Database struct {
 	Model        string // Model per https://github.com/chop-dbhi/data-models.
 	ModelVersion string // Model version per https://github.com/chop-dbhi/data-models.
 	DatabaseUrl  string // Better would be `DB *sql.DB`, but that is not adequate for loading data the way we will do it initially.
-	Schema       string // This is needed for PostgreSQL if a suitable search_path is not being set automatically per database or user. This may be a *comma-separated list of schemas*.
+	SearchPath   string // This is needed for PostgreSQL if a suitable search_path is not being set automatically per database or user. This may be a comma-separated list of schemas.
 	DmsaUrl      string // data-models-sqlalchemy base URL, or "" for the default. The URL should include the database name.
 
 	db            *sql.DB        // Database handle?
@@ -56,8 +58,99 @@ func joinUrlPath(base string, path string) string {
 	}
 }
 
-func openDatabase(driverName string, databaseUrl string) (*sql.DB, error) {
-	db, err := sql.Open(driverName, databaseUrl)
+// driverNameFromUrl returns a driver name (derived from the scheme) from a database URI.
+func driverNameFromUrl(urlString string) (string, error) {
+	url, err := url.Parse(urlString)
+	if err != nil {
+		return "", fmt.Errorf("Invalid URL '%s': %v", urlString, err)
+	}
+	if url.Scheme == "postgres" || url.Scheme == "postgresql" {
+		return "postgres", nil
+	} else {
+		return "", fmt.Errorf("Unsupported database scheme '%s'", url.Scheme)
+	}
+}
+
+// unpackDatabaseUrl - unpack a database URL into a map of key/value pairs, per https://godoc.org/github.com/lib/pq.
+func unpackDatabaseUrl(url string) (urlComponents map[string]string, err error) {
+	connectionString, err := pq.ParseURL(url)
+	if err != nil {
+		err = fmt.Errorf("Invalid database URL: %v", url)
+		return
+	}
+
+	urlComponents = make(map[string]string)
+	pairs := strings.Split(connectionString, " ")
+	for _, pair := range pairs {
+		pairSlice := strings.Split(pair, "=")
+		urlComponents[pairSlice[0]] = pairSlice[1]
+	}
+
+	return
+}
+
+// newDatabaseConnectionString - return libpq-style connection string usable by sql.Open with the postgres driver.
+func newDatabaseConnectionString(urlComponents map[string]string) string {
+	var pairs []string
+	for key, value := range urlComponents {
+		pairs = append(pairs, key+"="+value)
+	}
+
+	return strings.Join(pairs, " ")
+}
+
+// connectionStringFromDbUriAndSearchPath returns a connection string usable by the `pq` driver including search_path.
+// TODO: We assume that the databaseUrl does not contain a
+// search_path.  If the user passes in a libpq-compliant URI that
+// includes search_path in the options, our override may or may not
+// work, depending on how `pq` is implemented. We take advantage of a
+// `pq` driver extension, which is the ability to include search_path
+// in the top level of the connection string.
+func connectionStringFromDbUriAndSearchPath(databaseUrl string, searchPath string) (string, error) {
+	connMap, err := unpackDatabaseUrl(databaseUrl)
+	if err != nil {
+		return "", err
+	}
+
+	connMap["search_path"] = searchPath
+
+	return newDatabaseConnectionString(connMap), nil
+}
+
+// primarySchemaInPath returns the first schema in a PostgreSQL search path.
+func primarySchemaInSearchPath(searchPath string) (string, error) {
+	schemas := strings.Split(searchPath, ",")
+	if len(schemas) == 0 {
+		return "", fmt.Errorf("search path should not be empty")
+	}
+	schema := strings.TrimSpace(schemas[0])
+	if len(schema) == 0 {
+		return "", fmt.Errorf("first schema in search path should not be empty")
+	}
+	return schema, nil
+}
+
+// OpenDatabase is a low-level function that opens a database using a DBURI and sets a search_path for the connection.
+func OpenDatabase(databaseUrl string, searchPath string) (*sql.DB, error) {
+
+	var (
+		connStr    string
+		driverName string
+		err        error
+		db         *sql.DB
+	)
+
+	connStr, err = connectionStringFromDbUriAndSearchPath(databaseUrl, searchPath)
+	if err != nil {
+		return nil, err
+	}
+
+	driverName, err = driverNameFromUrl(databaseUrl)
+	if err != nil {
+		return nil, err
+	}
+
+	db, err = sql.Open(driverName, connStr)
 	if err != nil {
 		return db, fmt.Errorf("Error opening %s: %v", databaseUrl, err)
 	}
@@ -125,47 +218,15 @@ func (d *Database) checkModelAndVersion() error {
 	return nil
 }
 
-// Transact wraps database activity in a transaction.
-// Stolen from http://stackoverflow.com/a/23502629/390663
-func transact(db *sql.DB, txFunc func(*sql.Tx, ...interface{}) error, args ...interface{}) (err error) {
-	var tx *sql.Tx
-	if db != nil {
-		tx, err = db.Begin()
-		if err != nil {
-			return
-		}
-	}
-	defer func() {
-		if p := recover(); p != nil {
-			switch p := p.(type) {
-			case error:
-				err = p
-			default:
-				err = fmt.Errorf("%s", p)
-			}
-		}
-		if err != nil {
-			if tx != nil {
-				tx.Rollback()
-			}
-			return
-		}
-		if tx != nil {
-			err = tx.Commit()
-		}
-	}()
-	return txFunc(tx, args...)
-}
-
 // execute runs a SQL statement within a transaction `tx` or prints the SQL
-// on stdout if tx is nil.  Leading whitespace is stripped, for clean logs.
-func executeSQL(tx *sql.Tx, sql string) error {
+// on stdout if db is nil.  Leading whitespace is stripped, for clean logs.
+func executeSQL(db *sql.DB, sql string) error {
 	sql = strings.TrimSpace(sql)
-	if tx == nil {
+	if db == nil {
 		fmt.Printf("%s;\n", sql)
 	} else {
-		//    fmt.Printf("%s;\n", sql)
-		if _, err := tx.Exec(sql); err != nil {
+		log.Info(fmt.Printf("executeSQL: %s", sql))
+		if _, err := db.Exec(sql); err != nil {
 			return fmt.Errorf("Error executing SQL: %v: %v", sql, err)
 		}
 	}
@@ -355,19 +416,22 @@ func dmsaSql(d *Database, ddlOperator string, ddlOperand string, patterns interf
 //  * a Database object,
 //  * the DMSA DDL operation ("ddl" or "drop"),
 //  * the DMSA operand ("tables", "indexes", or "constraints",
-//  * and a struct containing pattern strings, of type normalPatternsType or mapPatternsType.
+//  * a struct containing pattern strings, of type normalPatternsType or mapPatternsType.
+//  * and an error sensitivity level: "normal" (ignore "does not exist" and "already exists" errors), "strict" (ignore no errors) or "force" (ignore all errors)
+//
+// All statements are executed regardless of success or failure, and all errors are logged at error level.
+//
+// TODO: the whole SQL execution pattern should be rewritten to follow Aaron's Python module.
 //
 // See also dmsaSql.
-//
-// `tx` is a transaction handle suitable for executing SQL statements.
-// If tx is nil, SQL is emitted on stdout instead of being executed.
-func operateOnTables(tx *sql.Tx, args ...interface{}) error {
+func operateOnTables(db *sql.DB, args ...interface{}) error {
 	var (
 		err          error
 		d            *Database = args[0].(*Database)
 		ddlOperation           = args[1].(string)
 		ddlOperand             = args[2].(string)
 		patterns               = args[3]
+		errorMode              = args[4]
 	)
 
 	var stmts []string
@@ -375,37 +439,43 @@ func operateOnTables(tx *sql.Tx, args ...interface{}) error {
 	if err != nil {
 		return err
 	}
+	log.Info(fmt.Sprintf("num stmts = %d", len(stmts)))
 
-	if d.Schema != "" {
-		if d.driverName == "postgres" {
-			if err = executeSQL(tx, fmt.Sprintf("SET search_path TO %s", d.Schema)); err != nil {
-				return err
-			}
-		} else {
-			return fmt.Errorf("Schemas are currently supported only for PostgreSQL")
-		}
-	}
+	var errors []error
 
 	for _, stmt := range stmts {
-		if err = executeSQL(tx, stmt); err != nil {
-			return fmt.Errorf("Error executing SQL: `%v`: %v", stmt, err)
+		if err = executeSQL(db, stmt); err != nil {
+			errors = append(errors, err)
 		}
 	} // end for all SQL statements
+
+	var fatal bool
+
+	if errorMode != "force" {
+		for _, err = range errors {
+			if errorMode == "normal" {
+				// Maybe tolerate this error
+				errStr := err.Error()
+				if strings.Contains(errStr, "already exists") || strings.Contains(errStr, "does not exist") {
+					log.Debug(fmt.Sprintf("ignoring error: %v", err))
+				} else {
+					log.Error(fmt.Sprintf("fatal error: %v", err))
+					fatal = true
+				}
+			} else if errorMode == "strict" {
+				log.Error(fmt.Sprintf("fatal error: %v", err))
+				fatal = true
+			} else {
+				return fmt.Errorf("Invalid error mode: %s", errorMode)
+			}
+		}
+	}
+
+	if fatal {
+		return fmt.Errorf("one or more fatal errors during %s-%s; see error messages in log", ddlOperation, ddlOperand)
+	}
 	return nil
 } // end func operateOnTables
-
-// driverNameFromUrl returns a driver name (derived from the scheme) from a database URL
-func driverNameFromUrl(urlString string) (string, error) {
-	url, err := url.Parse(urlString)
-	if err != nil {
-		return "", fmt.Errorf("Invalid URL '%s': %v", urlString, err)
-	}
-	if url.Scheme == "postgres" || url.Scheme == "postgresql" {
-		return "postgres", nil
-	} else {
-		return "", fmt.Errorf("Unsupported database scheme '%s'", url.Scheme)
-	}
-}
 
 // versionMatchesMinorVersion returns true if a version X.Y.Z has X.Y matching a reference version A.B.
 func versionMatchesMinorVersion(version string, referenceMinorVersion string) bool {
@@ -414,7 +484,7 @@ func versionMatchesMinorVersion(version string, referenceMinorVersion string) bo
 }
 
 // Open is the constructor for the Database object; it validates properties and opens a connection to the database.
-func Open(model string, modelVersion string, databaseUrl string, schema string, dmsaUrl string, includeTablesPat string, excludeTablesPat string) (*Database, error) {
+func Open(model string, modelVersion string, databaseUrl string, searchPath string, dmsaUrl string, includeTablesPat string, excludeTablesPat string) (*Database, error) {
 	var err error
 
 	if dmsaUrl == "" {
@@ -426,7 +496,8 @@ func Open(model string, modelVersion string, databaseUrl string, schema string, 
 		if excludeTablesPat == "" {
 			excludeTablesPat = pedsnetVocabTablesPat
 			if !versionMatchesMinorVersion(modelVersion, pedsnetMinorVersionSupported) {
-				fmt.Fprintf(os.Stderr, "WARNING: this code only supports the %s version series for the pedsnet model", pedsnetMinorVersionSupported)
+				log.WithFields(log.Fields{"VersionSupported": pedsnetMinorVersionSupported}).Warn(
+					fmt.Sprintf("WARNING: this code only supports the %s version series for the pedsnet model", pedsnetMinorVersionSupported))
 			}
 		}
 	} else if model == "pedsnet-vocab" {
@@ -453,17 +524,18 @@ func Open(model string, modelVersion string, databaseUrl string, schema string, 
 		}
 	}
 
-	d := &Database{Model: model, ModelVersion: modelVersion, DatabaseUrl: databaseUrl, Schema: schema, DmsaUrl: dmsaUrl, includeTables: includeTables, excludeTables: excludeTables}
+	driverName, err := driverNameFromUrl(databaseUrl)
+	if err != nil {
+		return nil, fmt.Errorf("Open of database failed: %v", err)
+	}
+
+	d := &Database{Model: model, ModelVersion: modelVersion, DatabaseUrl: databaseUrl, SearchPath: searchPath, DmsaUrl: dmsaUrl, driverName: driverName, includeTables: includeTables, excludeTables: excludeTables}
 
 	if err = d.checkModelAndVersion(); err != nil {
 		return nil, err
 	}
 
-	if d.driverName, err = driverNameFromUrl(databaseUrl); err != nil {
-		return nil, err
-	}
-
-	if d.db, err = openDatabase(d.driverName, d.DatabaseUrl); err != nil {
+	if d.db, err = OpenDatabase(d.DatabaseUrl, searchPath); err != nil {
 		return nil, err
 	}
 
@@ -482,7 +554,7 @@ func (d *Database) Close() error {
 // CreateTables creates the data model tables.
 // DDL SQL is obtained from the data-models-sqlalchemy service, i.e.
 // https://data-models-sqlalchemy.research.chop.edu/{Model}/{ModelVersion}/ddl/postgresql/tables/.
-func (d *Database) CreateTables() error {
+func (d *Database) CreateTables(errorMode string) error {
 
 	var tablePattern string
 	if d.driverName == "postgres" {
@@ -490,54 +562,54 @@ func (d *Database) CreateTables() error {
 	} else {
 		return fmt.Errorf("Unsupported database driver: %s", d.driverName)
 	}
-	return transact(d.db, operateOnTables, d, "ddl", "tables", normalPatternsType{tablePattern})
+	return operateOnTables(d.db, d, "ddl", "tables", normalPatternsType{tablePattern}, errorMode)
 }
 
 // CreateIndexes adds indexes to the data model tables.
 // SQL for the operation is obtained from the data-models-sqlalchemy service,
 // e.g. https://data-models-sqlalchemy.research.chop.edu/{Model}/{ModelVersion}/ddl/postgresql/indexes/.
-func (d *Database) CreateIndexes() error {
+func (d *Database) CreateIndexes(errorMode string) error {
 	var tablePattern string
 	if d.driverName == "postgres" {
 		tablePattern = `ON (\w+) \(`
 	} else {
 		return fmt.Errorf("Unsupported database driver: %s", d.driverName)
 	}
-	return transact(d.db, operateOnTables, d, "ddl", "indexes", normalPatternsType{tablePattern})
+	return operateOnTables(d.db, d, "ddl", "indexes", normalPatternsType{tablePattern}, errorMode)
 }
 
 // CreateConstraints adds integrity constraints to the data model tables.
 // SQL for the operation is obtained from the data-models-sqlalchemy service,
 // e.g. https://data-models-sqlalchemy.research.chop.edu/{Model}/{ModelVersion}/ddl/postgresql/constraints/.
-func (d *Database) CreateConstraints() error {
+func (d *Database) CreateConstraints(errorMode string) error {
 	var tablePattern string
 	if d.driverName == "postgres" {
 		tablePattern = `ALTER TABLE (\w+)`
 	} else {
 		return fmt.Errorf("Unsupported database driver: %s", d.driverName)
 	}
-	return transact(d.db, operateOnTables, d, "ddl", "constraints", normalPatternsType{tablePattern})
+	return operateOnTables(d.db, d, "ddl", "constraints", normalPatternsType{tablePattern}, errorMode)
 }
 
 // DropTables drops the data model tables.
 // Constraints and indexes should already have been dropped.
 // SQL for the operation is obtained from the data-models-sqlalchemy service, e.g.
 // https://data-models-sqlalchemy.research.chop.edu/{Model}/{ModelVersion}/drop/postgresql/tables/.
-func (d *Database) DropTables() error {
+func (d *Database) DropTables(errorMode string) error {
 	var tablePattern string
 	if d.driverName == "postgres" {
 		tablePattern = `DROP TABLE.* (\w+)`
 	} else {
 		return fmt.Errorf("Unsupported database driver: %s", d.driverName)
 	}
-	return transact(d.db, operateOnTables, d, "drop", "tables", normalPatternsType{tablePattern})
+	return operateOnTables(d.db, d, "drop", "tables", normalPatternsType{tablePattern}, errorMode)
 }
 
 // DropIndexes drops indexes from the data model tables.
 // For best performance, constraints should be dropped before dropping indexes.
 // SQL for the operation is obtained from the data-models-sqlalchemy service,
 // e.g. https://data-models-sqlalchemy.research.chop.edu/{Model}/{ModelVersion}/drop/postgresql/indexes/.
-func (d *Database) DropIndexes() error {
+func (d *Database) DropIndexes(errorMode string) error {
 	var createIndexTableNamePattern, createIndexIndexNamePattern, dropIndexIndexNamePattern string
 	if d.driverName == "postgres" {
 		createIndexTableNamePattern = ` ON (\w+) \(`
@@ -546,19 +618,19 @@ func (d *Database) DropIndexes() error {
 	} else {
 		return fmt.Errorf("Unsupported database driver: %s", d.driverName)
 	}
-	return transact(d.db, operateOnTables, d, "drop", "indexes", mapPatternsType{createIndexTableNamePattern, createIndexIndexNamePattern, dropIndexIndexNamePattern})
+	return operateOnTables(d.db, d, "drop", "indexes", mapPatternsType{createIndexTableNamePattern, createIndexIndexNamePattern, dropIndexIndexNamePattern}, errorMode)
 }
 
 // DropConstraints drops integrity constraints from the data model tables.
 // Constraints should be dropped before dropping indexes and tables.
 // SQL for the operation is obtained from the data-models-sqlalchemy service,
 // e.g. https://data-models-sqlalchemy.research.chop.edu/{Model}/{ModelVersion}/ddl/postgresql/constraints/.
-func (d *Database) DropConstraints() error {
+func (d *Database) DropConstraints(errorMode string) error {
 	var tablePattern string
 	if d.driverName == "postgres" {
 		tablePattern = `ALTER TABLE (\w+)`
 	} else {
 		return fmt.Errorf("Unsupported database driver: %s", d.driverName)
 	}
-	return transact(d.db, operateOnTables, d, "drop", "constraints", normalPatternsType{tablePattern})
+	return operateOnTables(d.db, d, "drop", "constraints", normalPatternsType{tablePattern}, errorMode)
 }
