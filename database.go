@@ -513,7 +513,6 @@ func Open(model string, modelVersion string, databaseUrl string, searchPath stri
                 includeTablesPat = pedsnetVocabTablesPat
                 }
         }
-	
 
 	var includeTables, excludeTables *regexp.Regexp
 
