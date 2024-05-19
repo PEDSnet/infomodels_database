@@ -41,8 +41,8 @@ type Database struct {
 // version for which this list has been verified.  It is not safe to
 // use this list for any other version. A warning will be issued
 // if the requested ModelVersion doesn't match pedsnetMinorVersionSupported.
-var pedsnetMinorVersionSupported = "5.5"
-var pedsnetVocabTablesPat = `^(?:vocabulary|concept_definition|concept|concept_ancestor|concept_class|concept_relationship|concept_synonym|domain|drug_strength|relationship|source_to_concept_map)$`
+var pedsnetMinorVersionSupported = "5.4"
+var pedsnetVocabTablesPat = `^(?:vocabulary|cohort_definition|concept|concept_ancestor|concept_class|concept_relationship|concept_synonym|domain|drug_strength|relationship|source_to_concept_map)$`
 
 var defaultDmsaUrl = "https://data-models-sqlalchemy.research.chop.edu/"
 
